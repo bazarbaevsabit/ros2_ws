@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+import json
+import time
+import requests
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+
+# Адрес Ollama (для нативного запуска на ноутбуке)
+OLLAMA_URL = "http://localhost:11434/api/chat"
+# Название модели, которую мы собрали вручную
+MODEL = "qwen-local:latest" 
+
+SYSTEM_PROMPT = (
+    "Ты — контроллер робота-черепашки. Твоя задача — переводить команды в JSON.\n"
+    "Если команда простая (вперед, назад, налево, направо), верни ОДИН объект:\n"
+    "{\"linear_x\": 1.0, \"angular_z\": 0.0, \"duration\": 1.0}\n\n"
+    "Если команда сложная (нарисуй квадрат, нарисуй треугольник), верни МАССИВ объектов:\n"
+    "[\n"
+    "  {\"linear_x\": 1.0, \"angular_z\": 0.0, \"duration\": 2.0},\n"
+    "  {\"linear_x\": 0.0, \"angular_z\": 1.57, \"duration\": 1.0}\n"
+    "]\n\n"
+    "ПРАВИЛА:\n"
+    "1. Вперед (forward, go, алға): linear_x = 1.0, angular_z = 0.0, duration = 1.0\n"
+    "2. Назад (back, артқа): linear_x = -1.0, angular_z = 0.0, duration = 1.0\n"
+    "3. Налево (left, солға): linear_x = 0.0, angular_z = 1.57, duration = 1.0\n"
+    "4. Направо (right, оңға): linear_x = 0.0, angular_z = -1.57, duration = 1.0\n"
+    "5. Квадрат (square): 4 раза повторить [вперед 2 сек, поворот налево 1 сек (1.57 рад/с)]\n"
+    "6. Треугольник (triangle): 3 раза повторить [вперед 2 сек, поворот налево 1.5 сек (1.57 рад/с)]\n\n"
+    "ЗАПРЕЩЕНО писать текст, объяснения или markdown. Возвращай ТОЛЬКО валидный JSON (объект или массив)."
+)
+
+class TurtleLLMNode(Node):
+    def __init__(self):
+        super().__init__('turtle_llm_node')
+        self.sub = self.create_subscription(String, '/nlp_command', self.on_text, 10)
+        self.pub = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
+        self.get_logger().info('Нода запущена. Жду команды в /nlp_command...')
+
+    def execute_command(self, cmd):
+        # Извлекаем параметры
+        linear_x = float(cmd.get("linear_x", 0.0))
+        angular_z = float(cmd.get("angular_z", 0.0))
+        duration = float(cmd.get("duration", 1.0))
+        
+        # Safety Limiter (Ограничитель безопасности)
+        linear_x = max(min(linear_x, 1.0), -1.0)
+        angular_z = max(min(angular_z, 1.57), -1.57)
+        
+        # Публикуем команду
+        twist = Twist()
+        twist.linear.x = linear_x
+        twist.angular.z = angular_z
+        self.pub.publish(twist)
+        
+        self.get_logger().info(f'Выполняю: x={linear_x}, z={angular_z} ({duration} сек)')
+        
+        # Ждем, пока черепашка выполнит команду
+        time.sleep(duration)
+        
+        # Останавливаем черепашку после команды
+        stop_twist = Twist()
+        self.pub.publish(stop_twist)
+
+    def on_text(self, msg):
+        text = msg.data
+        self.get_logger().info(f'Получен текст: "{text}"')
+        
+        try:
+            # Запрос к Ollama
+            response = requests.post(OLLAMA_URL, json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": text}
+                ],
+                "stream": False,
+                "format": "json", # Встроенный JSON-режим Ollama
+                "options": {"temperature": 0}
+            }, timeout=120) # Увеличили таймаут, так как 0.5B на CPU думает долго
+            
+            # Парсинг ответа
+            resp_json = response.json()
+            content = resp_json["message"]["content"]
+            
+            # Очистка от возможных markdown-тегов
+            content = content.replace("```json", "").replace("```", "").strip()
+            result = json.loads(content)
+            
+            # Проверяем: это список (массив) или один объект?
+            if isinstance(result, list):
+                self.get_logger().info(f'Получен массив из {len(result)} команд. Начинаю выполнение...')
+                for cmd in result:
+                    self.execute_command(cmd)
+            else:
+                self.execute_command(result)
+                
+        except Exception as e:
+            self.get_logger().error(f'Ошибка LLM или парсинга: {e}')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TurtleLLMNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
